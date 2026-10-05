@@ -126,6 +126,9 @@ Chỉ dùng thông tin có trong bài. Trả về JSON đúng dạng:
 }}]}}
 Bài không nói về vụ việc cụ thể (tuyên truyền, hội nghị...) thì trả về {{"cases": []}}.
 
+Lưu ý quan trọng:
+- Nếu nhân vật có biệt danh/bí danh được ghi trong bài báo (ví dụ dạng "A, tức B", "A, biệt danh B", "A (B)"), bắt buộc đưa B vào "aliases".
+
 DANH SÁCH TỘI DANH: {crimes}
 DANH SÁCH CHẤT: {substances}
 
@@ -137,7 +140,7 @@ def extract_news_cases(doc: Document, llm_fn: Callable[[str], str], known_crimes
     """LLM extraction for one news article; charges are re-linked to law-KB crimes in code."""
     prompt = NEWS_EXTRACTION_PROMPT.format(
         crimes="; ".join(known_crimes), substances=", ".join(SUBSTANCES),
-        title=doc.metadata.get("title", ""), content=doc.content[:12000],
+        title=doc.metadata.get("title", ""), content=doc.content[:8000],
     )
     try:
         cases = json.loads(llm_fn(prompt)).get("cases", [])
@@ -251,7 +254,10 @@ class Neo4jGraph:
             FOREACH (s IN $substances | MERGE (sub:Substance {name: s.name}) MERGE (k)-[r:INVOLVES]->(sub)
                 SET r.amount = s.amount)
             FOREACH (p IN $people | MERGE (person:Person {name: p.name})
-                SET person.aliases = coalesce(p.aliases, [])
+                SET person.aliases = CASE
+                    WHEN size(coalesce(p.aliases, [])) > 0 THEN p.aliases
+                    ELSE coalesce(person.aliases, [])
+                END
                 MERGE (person)-[r:INVOLVED_IN]->(k) SET r.role = p.role, r.charge = p.charge, r.sentence = p.sentence)
             """,
             name=case.get("name") or doc.metadata.get("title", doc.id),
@@ -263,91 +269,163 @@ class Neo4jGraph:
 
     # ---------------------------------------------------------------- KG-3
 
-    def context(self, question: str, doc_ids: list[str], max_facts: int = 60) -> list[str]:
+    def context(self, question: str, doc_ids: list[str], max_facts: int = 30) -> list[str]:
         """Graph facts for a question: seeds + 1 hop, then the legal basis of every case reached."""
-        # 1. Seed facts (ontology-independent)
-        seed_ids, seed_fact_list = self.seed_facts(question, doc_ids, limit=max_facts)
-        facts = list(seed_fact_list)
+        facts: list[str] = []
+        q_lower = question.lower()
+        q_substances = [s.lower() for s in find_substances(question)]
+        is_aggregation = any(w in q_lower for w in ["những vụ", "các vụ", "tất cả", "danh sách", "liệt kê"])
+        asks_max_penalty = any(w in q_lower for w in ["tối đa", "cao nhất", "mức cao nhất", "khung cao nhất"])
 
-        # 2. Find cases related to seeds or question
+        # 1. Identify specific Person seeds in question
+        persons = self.run(
+            """
+            MATCH (p:Person)
+            WHERE (p.name IS :: STRING AND size(p.name) >= 3 AND toLower($q) CONTAINS toLower(p.name))
+               OR any(a IN coalesce(p.aliases, []) WHERE size(a) >= 3 AND toLower($q) CONTAINS toLower(a))
+            RETURN elementId(p) AS id, p.name AS name, p.aliases AS aliases
+            """,
+            q=question,
+        )
+        person_ids = [r["id"] for r in persons]
+
+        # 2. Identify specific Case seeds
         cases = self.run(
             """
             MATCH (k:Case)
-            WHERE elementId(k) IN $ids
-               OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
-               OR (size(k.name) >= 4 AND toLower($q) CONTAINS toLower(k.name))
+            WHERE (size(k.name) >= 4 AND toLower($q) CONTAINS toLower(k.name))
+               OR (size($person_ids) > 0 AND EXISTS { MATCH (p:Person)-[:INVOLVED_IN]->(k) WHERE elementId(p) IN $person_ids })
+               OR (size($person_ids) = 0 AND k.doc_id IN $doc_ids)
             RETURN DISTINCT elementId(k) AS id, k.name AS name, k.summary AS summary
             """,
-            ids=seed_ids, q=question,
+            q=question, person_ids=person_ids, doc_ids=doc_ids,
         )
         case_ids = [row["id"] for row in cases]
-        for row in cases:
-            if row.get("summary"):
-                facts.append(f"Vụ việc '{row['name']}': {row['summary']}")
 
-        # 3. From cases walk to the law KB: (Case)->(Crime)<-(Article)->(Clause)
-        if case_ids:
-            law_clauses = self.run(
+        # 3. Facts for Persons and their Cases
+        person_charges = []
+        if person_ids:
+            person_cases = self.run(
                 """
-                MATCH (k:Case)-[:CHARGED_WITH]->(c:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                MATCH (p:Person)-[r:INVOLVED_IN]->(k:Case)
+                WHERE elementId(p) IN $person_ids
+                RETURN p.name AS person_name, coalesce(p.aliases, []) AS aliases,
+                       k.name AS case_name, r.role AS role, r.charge AS charge, r.sentence AS sentence
+                """,
+                person_ids=person_ids,
+            )
+            for r in person_cases:
+                alias_str = f" (tức {', '.join(r['aliases'])})" if r.get("aliases") else ""
+                details = []
+                if r.get("role"): details.append(f"vai trò: {r['role']}")
+                if r.get("charge"):
+                    details.append(f"hành vi/tội danh: {r['charge']}")
+                    person_charges.append(r["charge"])
+                if r.get("sentence"): details.append(f"mức án: {r['sentence']}")
+                detail_str = f" ({', '.join(details)})" if details else ""
+                facts.append(f"[Nhân vật] {r['person_name']}{alias_str} liên quan trong vụ '{r['case_name']}'{detail_str}.")
+
+        # 4. Facts for Cases (Summary, Substances, Crimes)
+        for c in cases:
+            if c.get("summary"):
+                facts.append(f"[Vụ việc] '{c['name']}': {c['summary']}")
+
+        if case_ids:
+            # Substances in these cases
+            case_subs = self.run(
+                """
+                MATCH (k:Case)-[r:INVOLVES]->(s:Substance)
                 WHERE elementId(k) IN $case_ids
-                  AND (
-                    cl.number = 1
-                    OR cl.number = 4
-                    OR EXISTS { MATCH (k)-[:INVOLVES]->(s:Substance)<-[:MENTIONS]-(cl) }
-                  )
-                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
-                ORDER BY a.id, cl.number
+                RETURN k.name AS case_name, s.name AS sub_name, r.amount AS amount
                 """,
                 case_ids=case_ids,
             )
-            for row in law_clauses:
-                facts.append(f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}")
+            for r in case_subs:
+                amt = f" ({r['amount']})" if r.get("amount") else ""
+                facts.append(f"[Tang vật] Vụ '{r['case_name']}' liên quan chất {r['sub_name']}{amt}.")
 
-        # 4. Articles mentioned directly in the question
-        mentioned_articles = re.findall(r"[Đđ]iều\s+(\d+)", question)
-        q_substances = [s.lower() for s in find_substances(question)]
-        if mentioned_articles:
-            direct_clauses = self.run(
+            target_charges = list(set(person_charges))
+
+            # Crimes and Articles tied strictly to these specific cases (filtered by person charges if known)
+            case_crimes = self.run(
                 """
-                UNWIND $nums AS num
-                MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)
-                WHERE a.id CONTAINS ('Điều ' + num)
+                MATCH (k:Case)-[:CHARGED_WITH]->(c:Crime)<-[:DEFINES]-(a:Article)
+                WHERE elementId(k) IN $case_ids
+                  AND (size($charges) = 0 OR c.name IN $charges)
+                RETURN DISTINCT k.name AS case_name, c.name AS crime, a.id AS article_id, a.title AS article_title
+                """,
+                case_ids=case_ids, charges=target_charges,
+            )
+            for r in case_crimes:
+                facts.append(f"[Tội danh & Điều luật] Vụ '{r['case_name']}' bị truy tố/xử lý về tội '{r['crime']}', được quy định tại {r['article_id']} ({r['article_title']}).")
+
+            # Specific Clauses of those Articles
+            clauses = self.run(
+                """
+                MATCH (k:Case)-[:CHARGED_WITH]->(c:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE elementId(k) IN $case_ids
+                  AND (size($charges) = 0 OR c.name IN $charges)
                   AND (
-                    cl.number = 1
+                    $asks_max
+                    OR cl.number = 1
                     OR cl.number = 4
-                    OR ($has_subs AND EXISTS {
-                        MATCH (cl)-[:MENTIONS]->(s:Substance)
-                        WHERE toLower(s.name) IN $subs
-                    })
+                    OR EXISTS { MATCH (k)-[:INVOLVES]->(s:Substance)<-[:MENTIONS]-(cl) }
                   )
-                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                RETURN DISTINCT a.id AS article_id, a.title AS article_title, cl.number AS number, cl.penalty AS penalty, cl.text AS text
                 ORDER BY a.id, cl.number
                 """,
-                nums=mentioned_articles,
-                has_subs=bool(q_substances),
-                subs=q_substances,
+                case_ids=case_ids, charges=target_charges, asks_max=asks_max_penalty,
             )
-            for row in direct_clauses:
-                facts.append(f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}")
+            for r in clauses:
+                facts.append(f"[{r['article_id']} - {r['article_title']}] khoản {r['number']}: {r['text']}")
 
-        # 5. Substances mentioned in question: find all cases involving them (for aggregation questions like Q6)
-        if q_substances:
-            sub_cases = self.run(
+        # 5. Articles mentioned directly in the question or doc_ids (if no cases found)
+        mentioned_articles = re.findall(r"[Đđ]iều\s+(\d+)", question)
+        law_doc_ids = [d for d in doc_ids if d.startswith("blhs-") or d.startswith("pcmt-")] if not case_ids else []
+        if mentioned_articles or law_doc_ids:
+            direct_clauses = self.run(
                 """
-                MATCH (k:Case)-[:INVOLVES]->(s:Substance)
+                MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE (size($nums) > 0 AND any(num IN $nums WHERE a.id CONTAINS ('Điều ' + num)))
+                   OR (size($law_docs) > 0 AND a.doc_id IN $law_docs)
+                WITH DISTINCT a, cl
+                WHERE $asks_max
+                   OR cl.number = 1
+                   OR cl.number = 4
+                   OR ($has_subs AND EXISTS { MATCH (cl)-[:MENTIONS]->(s:Substance) WHERE toLower(s.name) IN $subs })
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                ORDER BY a.id, cl.number
+                LIMIT 15
+                """,
+                nums=mentioned_articles, law_docs=law_doc_ids,
+                asks_max=asks_max_penalty, has_subs=bool(q_substances), subs=q_substances,
+            )
+            for r in direct_clauses:
+                facts.append(f"[{r['article_id']} - {r['title']}] khoản {r['number']}: {r['text']}")
+
+        # 6. Aggregation queries (e.g. Q6)
+        if is_aggregation and q_substances:
+            agg_cases = self.run(
+                """
+                MATCH (k:Case)-[r:INVOLVES]->(s:Substance)
                 WHERE toLower(s.name) IN $subs
                 OPTIONAL MATCH (p:Person)-[:INVOLVED_IN]->(k)
-                RETURN k.name AS case_name, k.summary AS summary, s.name AS sub_name,
+                RETURN k.name AS case_name, k.summary AS summary, s.name AS sub_name, r.amount AS amount,
                        collect(DISTINCT p.name) AS people
                 """,
                 subs=q_substances,
             )
-            for row in sub_cases:
-                facts.append(f"Vụ việc '{row['case_name']}' liên quan chất {row['sub_name']}: {row['summary']}")
-                people = [p for p in row.get("people", []) if p]
+            for r in agg_cases:
+                amt = f" ({r['amount']})" if r.get("amount") else ""
+                facts.append(f"[Vụ việc liên quan {r['sub_name']}] '{r['case_name']}': {r['summary']}")
+                people = [p for p in r.get("people", []) if p]
                 if people:
-                    facts.append(f"Đối tượng liên quan trong vụ '{row['case_name']}': {', '.join(people)}")
+                    facts.append(f"Đối tượng/bị cáo liên quan trong vụ '{r['case_name']}': {', '.join(people)}.")
+
+        # Fallback to seed_facts if facts is too small
+        if len(facts) < 3:
+            _, raw_facts = self.seed_facts(question, doc_ids, limit=max_facts)
+            facts.extend(raw_facts)
 
         # Deduplicate and limit to max_facts
         seen = set()
@@ -384,6 +462,11 @@ def build_graph(graph: Neo4jGraph, law_docs: list[Document], news_docs: list[Doc
 
 GRAPH_PROMPT = """Trả lời câu hỏi chỉ dựa trên ngữ cảnh (đoạn văn bản và dữ kiện từ knowledge graph).
 Nêu rõ số Điều luật khi có. Nếu ngữ cảnh không đủ, nói không đủ thông tin.
+
+Hướng dẫn quan trọng:
+- Nếu dữ kiện graph xác định một vụ việc hoặc đối tượng bị truy tố/xử lý về tội danh nào và liên kết với Điều luật nào, phải giữ đúng cặp tội danh - Điều luật đó. Không tự thay số Điều bằng số Điều xuất hiện ở đoạn văn bản khác.
+- Nếu câu hỏi hỏi về hành vi/tội danh và hình phạt tối đa, hãy căn cứ vào điều luật tương ứng và nêu rõ khung hình phạt cao nhất (ví dụ khoản cao nhất).
+- Khi câu hỏi yêu cầu liệt kê các vụ việc và đối tượng/địa điểm, với mỗi vụ việc hãy nêu cụ thể cả tên đối tượng/bị cáo liên quan và địa điểm (nếu dữ kiện có cung cấp).
 
 Dữ kiện knowledge graph:
 {facts}

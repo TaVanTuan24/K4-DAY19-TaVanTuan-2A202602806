@@ -13,9 +13,16 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import time
 from dataclasses import dataclass, fields
 from typing import Any
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
 
 PROVIDERS = {
     "openai": {"key": "OPENAI_API_KEY", "base_url": None,
@@ -23,7 +30,7 @@ PROVIDERS = {
     "openrouter": {"key": "OPENROUTER_API_KEY", "base_url": "https://openrouter.ai/api/v1",
                    "chat": "openai/gpt-4o-mini", "embed": "openai/text-embedding-3-small"},
     "gemini": {"key": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-               "chat": "gemini-2.5-flash-lite", "embed": "gemini-embedding-001"},
+               "chat": "gemini-3.5-flash-lite", "embed": "gemini-embedding-001"},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
 }
@@ -36,6 +43,8 @@ PRICES_PER_M = {
     "gpt-4.1-nano": (0.10, 0.40),
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
+    "gemini-3.8-flash": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.075, 0.30),
     "gemini-2.5-flash-lite": (0.10, 0.40),
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
@@ -119,21 +128,45 @@ class MeteredLLM:
         if self.chat_provider == "anthropic":
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
+            default_max = 2048 if json_mode else 1024
+            kwargs: dict[str, Any] = {
+                "model": self.chat_model_id,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+                "max_tokens": default_max,
+            }
             if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    max_tokens=2048,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    max_tokens=2048,
-                )
+                kwargs["response_format"] = {"type": "json_object"}
+
+            response = None
+            for attempt in range(5):
+                try:
+                    response = self._chat_client.chat.completions.create(**kwargs)
+                    break
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    afford_match = re.search(r"can only afford (\d+)", err_msg)
+                    if afford_match:
+                        afford = int(afford_match.group(1))
+                        kwargs["max_tokens"] = max(afford - 10, 60)
+                        time.sleep(1)
+                        continue
+                    limit_match = re.search(r"prompt tokens limit exceeded: (\d+) > (\d+)", err_msg)
+                    if limit_match:
+                        needed, allowed = int(limit_match.group(1)), int(limit_match.group(2))
+                        if kwargs["max_tokens"] > 70:
+                            kwargs["max_tokens"] = 60
+                            time.sleep(1)
+                            continue
+                        cur_text = kwargs["messages"][0]["content"]
+                        ratio = max(allowed - 100, 500) / max(needed, 1)
+                        kwargs["messages"][0]["content"] = cur_text[:int(len(cur_text) * ratio)]
+                        time.sleep(1)
+                        continue
+                    if ("402" in err_msg or "503" in err_msg or "demand" in err_msg or "in_flight" in err_msg or "in-flight" in err_msg or "rate" in err_msg or "busy" in err_msg) and attempt < 4:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    raise
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -160,7 +193,17 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        response = None
+        for attempt in range(5):
+            try:
+                response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+                break
+            except Exception as e:
+                err_msg = str(e).lower()
+                if ("402" in err_msg or "in_flight" in err_msg or "in-flight" in err_msg or "rate" in err_msg or "busy" in err_msg) and attempt < 4:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
