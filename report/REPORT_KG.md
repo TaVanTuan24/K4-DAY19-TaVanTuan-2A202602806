@@ -110,7 +110,7 @@ $ python bench_kg.py --check
 ```
 
 Ảnh Neo4j: `report/img/kg_count.png`, `report/img/kg_cross_kb.png`, `report/img/kg_my_case.png`.
-Người đã chọn cho `kg_my_case.png`: `DJ Thái Hoàng` (vụ án tại Viện Pháp y tâm thần Trung ương, liên quan tội tổ chức sử dụng ma túy theo Điều 255 BLHS và các chất Ketamine, MDMA, Methamphetamine, Cần sa).
+Người đã chọn cho `kg_my_case.png`: `Cái Quang Huy` (vụ vận chuyển ma túy từ Đức về Việt Nam, truy tố tội vận chuyển trái phép chất ma túy theo Điều 250 BLHS, tang vật gồm MDMA và Ketamine tại Hà Nội).
 
 ## Vấn đề gặp phải (không tính điểm)
 
