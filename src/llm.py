@@ -124,6 +124,7 @@ class MeteredLLM:
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
+                    max_tokens=2048,
                     response_format={"type": "json_object"},
                 )
             else:
@@ -131,6 +132,7 @@ class MeteredLLM:
                     model=self.chat_model_id,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
+                    max_tokens=2048,
                 )
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
